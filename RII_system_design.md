@@ -527,7 +527,162 @@ This is the original zero-shot CLIP approach: `"A photo of a " + category_name` 
 
 ---
 
-## Part 8: 深度技术面试 Q&A
+## Part 8: LoRA 参数选择与效果分析
+
+### 可训练参数量计算
+
+ViT-B/16 的 attention 层维度：hidden_dim=768，每层有 q/k/v/out 四个投影矩阵（各 768×768）
+
+```
+每层 LoRA 参数：
+  4个矩阵 × (A矩阵 768×16 + B矩阵 16×768)
+  = 4 × 2 × 768 × 16 = 98,304
+
+12层 transformer：
+  12 × 98,304 = 1,179,648 ≈ 1.2M
+
+visual_projection（full retrain）：
+  768 × 512 = 393,216 ≈ 0.4M
+
+总可训练参数：~1.6M
+base CLIP vision model 总参数：~87M
+可训练比例：~1.8%
+```
+
+---
+
+### 参数逐一解析
+
+| 参数 | 值 | 效果 |
+|---|---|---|
+| `lora_r` | 16 | 低秩矩阵的秩，控制表达能力 |
+| `lora_alpha` | 32 | 缩放因子，effective_scale = alpha/r = 2.0 |
+| `lora_dropout` | 0.1 | adapter 内部 dropout，防止过拟合 |
+| `learning_rate` | 5e-4 | 专门给 adapter 的 LR，比全量微调高 50x |
+| `weight_decay` | 0.01 | AdamW 正则化 |
+| `warmup_steps` | 500 | 线性 warmup，防止训练初期 LR 过大破坏 adapter 初始化 |
+| `max_grad_norm` | 1.0 | 梯度裁剪，稳定训练 |
+| `batch_size` | 64 | InfoNCE loss 需要足够大的 batch（负样本数量） |
+
+---
+
+### r=16 的效果
+
+```
+r 越小 → 参数少 → 欠拟合风险，无法充分适配购物车域
+r 越大 → 参数多 → 接近全量微调，失去 LoRA 优势
+
+r=4  → 每层 4×4×768×2 = 24K params，表达能力弱
+r=16 → 每层 4×16×768×2 = 98K params，中等表达能力  ← 选这个
+r=64 → 每层 4×64×768×2 = 393K params，接近全量
+```
+
+r=16 是工业界最常用的默认值（LoRA 原论文在 NLP 任务上验证），在购物车视觉域适配这个任务复杂度下刚好够用。
+
+---
+
+### alpha=32 的效果
+
+LoRA 的实际更新公式：
+
+```
+W_new = W_base + (alpha/r) × B × A
+       = W_base + 2.0 × B × A
+```
+
+alpha/r = 2.0 意味着 adapter 的输出被放大 2 倍再加到原始权重上。这个 scaling 的实际效果等价于把 adapter 的有效 LR 乘以 2，让 adapter 学习更快，但不改变 base model 的更新速度。
+
+如果 alpha=r（=16），scale=1.0，adapter 更新更保守。alpha=32 是常见的 "2x scale" 选择，让 adapter 在有限 epoch 内能学到足够多。
+
+---
+
+### dropout=0.1 的效果
+
+LoRA dropout 作用在 A 矩阵的输出上（即进入 B 之前）：
+
+```
+output = W_base(x) + (alpha/r) × B(dropout(A(x)))
+```
+
+购物车数据量相对有限，dropout=0.1 防止 adapter 过拟合到训练集的特定商品。数据量更大可以降到 0.05，数据量更小可以升到 0.15。
+
+---
+
+### LR=5e-4 为什么比全量高 50x
+
+```
+全量微调 LR = 1e-5
+LoRA LR    = 5e-4  (50x 更大)
+```
+
+原因：LoRA 的 A 矩阵初始化为 random Gaussian，B 矩阵初始化为全零。初始时 LoRA 输出为零，不影响 base model。需要更大的 LR 才能让 adapter 从零开始有效学习。而 base model 的权重是冻结的，大 LR 不会破坏预训练表征。
+
+---
+
+### CosineAnnealingLR 的效果
+
+```
+LR 从 5e-4 开始，余弦衰减到 5e-4 × 0.1 = 5e-5
+T_max = total_steps（全程衰减，不重启）
+```
+
+训练初期大 LR 快速适配，后期小 LR 精细调整。对于 10 epoch 的短训练，cosine schedule 比 step decay 更平滑，不会因为 LR 突然下降导致 loss spike。
+
+---
+
+### batch_size=64 与 InfoNCE loss 的关系
+
+CLIP 的对比损失是 InfoNCE，batch 内每个样本互为负样本：
+
+```
+loss = -log( exp(sim(i,i)/τ) / Σ_j exp(sim(i,j)/τ) )
+
+batch_size=64  → 每个样本有 63 个负样本
+batch_size=256 → 每个样本有 255 个负样本（更难的负样本，loss 更准确）
+```
+
+batch=64 是受 GCP 显存约束的选择（不是最优，原始 CLIP 用 32768）。可以用 `gradient_accumulation_steps` 模拟更大 batch，代码里默认是 1，说明这个约束是已知的取舍。
+
+---
+
+### 参数选择总结
+
+```
+r=16, alpha=32
+  → 1.8% 可训练参数
+  → 有效 scale=2.0，适配速度快
+  → 保留 98.2% 预训练知识
+
+dropout=0.1 + weight_decay=0.01 + max_grad_norm=1.0
+  → 三层正则化防止在小数据集上过拟合
+
+LR=5e-4 + warmup_500 + cosine_decay
+  → 快速收敛 + 平滑衰减，适合 10 epoch 短训练
+
+target_modules=["q_proj","v_proj","k_proj","out_proj"]
+  → 全 attention 适配，改变"看什么"和"怎么表达"
+
+modules_to_save=["visual_projection"]
+  → 完全重塑 embedding 几何空间
+```
+
+所有 LoRA 超参数均通过 CLI 参数暴露（`--lora_r`, `--lora_alpha`, `--lora_dropout` 等），方便后续做超参数 sweep。代码中没有记录完整的 ablation 结果，当前值基于 NLP LoRA 最佳实践加小规模验证后固定。
+
+---
+
+## Part 9: 深度技术面试 Q&A
+
+### 模块零：LoRA 参数
+
+**Q0: LoRA 的 r=16, alpha=32 是怎么选的？训练了多少参数？**
+
+ViT-B/16 共 ~87M 参数，LoRA 只训练 ~1.6M（1.8%）：
+- 12层 × 4矩阵 × 2方向（A+B）× 768×16 = 1.2M（adapter）
+- visual_projection 768×512 = 0.4M（full retrain）
+
+r=16 是中间值：r=4 表达能力不足，r=64 接近全量微调。alpha=32 使 effective_scale=2.0，等价于给 adapter 的有效 LR 再乘 2 倍，让 adapter 从零初始化（B=0）快速收敛。LR=5e-4 比全量高 50x，因为 base model 冻结了，大 LR 只影响 adapter，不破坏预训练表征。
+
+---
 
 ### 模块一：系统设计
 
