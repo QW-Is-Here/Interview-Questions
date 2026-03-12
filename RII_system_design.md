@@ -123,37 +123,6 @@ Output: 512-dim L2-normalized embedding
 
 ---
 
-```
-  ┌──────────────────┬────────────────────────────────────┬────────────────────────────────────────────┬──────┐
-  │      Route       │                File                │                Supervision                 │  LR  │
-  ├──────────────────┼────────────────────────────────────┼────────────────────────────────────────────┼──────┤
-  │ LoRA finetune    │ peft_finetune/main.py              │ image-text (frozen text encoder as anchor) │ 5e-4 │
-  ├──────────────────┼────────────────────────────────────┼────────────────────────────────────────────┼──────┤
-  │ Full finetune    │ full_finetune/main.py              │ image-text (frozen text encoder as anchor) │ 1e-5 │
-  ├──────────────────┼────────────────────────────────────┼────────────────────────────────────────────┼──────┤
-  │ Catalog finetune │ image_catalog_training/finetune.py │ image-image only (no text at all)          │ 1e-5 │
-  └──────────────────┴────────────────────────────────────┴────────────────────────────────────────────┴──────┘
-
-  What the three are actually for
-
-  image_catalog_training    Early experiment / baseline
-          |                 Pure image-image, older OpenAI clip library
-          |                 Likely the first attempt before text supervision
-          v
-
-  full_finetune             Ablation baseline
-          |                 Full parameter update, heavier
-          |                 Used to measure: does LoRA match full finetune quality?
-          v
-
-  peft_finetune (LoRA)      Production model
-                            Small adapter, deployable to Jetson
-                            What actually goes through ONNX -> TRT -> edge
-
-  It's an iterative research progression, not three parallel deployed models. You compare all three in offline eval (evaluate.py), pick
-  the best, deploy only that one. The LoRA route won the tradeoff between accuracy and deployability.
-```
-
 ### 1.3 LoRA Fine-tuning (Main Route)
 
 ```python
@@ -553,6 +522,211 @@ This is the original zero-shot CLIP approach: `"A photo of a " + category_name` 
 | Produce type filter before re-id | Fresh produce has no barcode; re-identification not applicable; avoids false positives |
 | z-movement threshold | Filters out stationary item shifts; real removal has clear upward trajectory |
 | Model version-aware thresholds | v1 vs v2 models have different embedding spaces; per-version thresholds tuned separately |
+
+---
+
+---
+
+## Part 8: 深度技术面试 Q&A
+
+### 模块一：系统设计
+
+**Q1: 用3分钟介绍一下你的 RII 系统。**
+
+RII 是部署在 Instacart Caper 智能购物车上的实时商品识别系统。核心问题是：用户从购物车里取出一件商品时，没有条形码信息，需要用视觉来判断取出的是哪件商品。
+
+整体是一个 visual retrieval 系统，分三个阶段：
+
+- **索引阶段**：当用户扫描条形码把商品加入购物车时，用 CLIP visual encoder 对该商品的多角度图像提取 512-dim embedding，再用 K-means（k=4）聚类成 4 个 cluster centroid，存在内存里，代表这件商品的主要视觉外观
+- **检索阶段**：当轨迹状态机检测到 REMOVE 事件时，取时间窗口内的 query embedding，对购物车里每件商品的 4 个 centroid 做 brute-force cosine similarity，取最大值后 mean 聚合，排名最高的就是被取出的商品
+- **模型**：base 是 CLIP ViT-B/16，用 LoRA（r=16）在购物车商品数据上微调，只导出 visual encoder 部署到 Jetson 边缘设备，通过 TensorRT 加速
+
+---
+
+**Q2: 为什么用 retrieval 而不是 classification？**
+
+两个核心原因：
+
+**1. 商品空间是开放集合（open set）**。超市有几万 SKU，每家门店商品不同，每天都有新品上架。如果做 classification，每次加新商品都要重新训练、重新部署模型，在边缘设备上完全不可行。Retrieval 只需要在加入购物车时动态建索引，zero-shot 支持新商品。
+
+**2. 购物车上下文天然是 retrieval 问题**。我们已经知道购物车里有哪些商品（扫码时建了索引），removal 时的候选集就是当前购物车的商品，通常不超过 20 件。这是一个 closed-set retrieval，候选空间极小，不需要大规模 ANN 索引。
+
+---
+
+**Q3: 你们的系统跟搜广推里的双塔模型有什么关系？**
+
+本质上是同一个范式。双塔模型里 user tower 和 item tower 分别编码，用向量相似度召回。我们的系统里：
+
+- **Query tower** = 取出商品时的实时 crop → CLIP visual encoder → query embedding
+- **Item tower** = 加购时的多角度 crop → CLIP visual encoder → K-means centroid
+
+区别在于：搜广推的双塔 query 是用户行为序列，item 是商品特征，两个 tower 结构可以不同。我们是**同构双塔**（query 和 index 用同一个 visual encoder），更接近 image-to-image retrieval。另一个区别是我们的候选集是动态的（每次购物都不同），没有离线建好的固定 item index，是每次购物实时构建的。
+
+---
+
+### 模块二：模型训练
+
+**Q4: 为什么选 LoRA 而不是全量微调？r=16 怎么选的？**
+
+**为什么 LoRA**：
+- 部署约束。Jetson 边缘设备内存有限，LoRA adapter 只有几 MB，全量 checkpoint 几百 MB
+- 训练数据量有限（购物车数据相比 CLIP 预训练数据小很多），全量微调容易过拟合或破坏预训练表征
+- LoRA 可以用更大的 LR（5e-4 vs 全量的 1e-5）而不破坏原有表征，收敛更快
+
+**r=16 的选择**：
+r 控制低秩矩阵的秩，即可训练参数量。r=16 是经验性的中间值：
+- r 太小（r=4）：表达能力不足，可能无法学到购物车域的视觉特征
+- r 太大（r=64）：接近全量微调，失去 LoRA 的优势
+- r=16 在 NLP 任务上被广泛验证有效，在评估集上对比了 r=8/16/32，r=16 在精度和参数量上取得最好平衡
+
+alpha=32，effective scale = alpha/r = 2.0，相当于对 LoRA 输出做 2 倍放大，等价于给 LoRA 的 LR 乘以 2，让适配器学习更快。
+
+---
+
+**Q5: 为什么 target_modules 包含 out_proj？很多 LoRA 实现只加在 q_proj 和 v_proj。**
+
+`q_proj` 和 `v_proj` 控制 attention pattern（关注哪里、如何加权），而 `out_proj` 是 multi-head attention 的输出投影，把各个 head 的结果聚合回 hidden space。
+
+对于视觉域适应来说，我们不只需要改变"看哪里"，还需要改变"看到之后怎么表达"。购物车图像和 CLIP 预训练数据（网络图像）的视觉统计特性差异很大（低光、grayscale、固定视角），`out_proj` 的适配让模型能重新组合各个 head 的特征，更适合这个域。
+
+不加 `out_proj` 的话，attention 分布变了但输出空间没变，会有信息瓶颈。实验上加了 `out_proj` 之后 Top-1 有明显提升。
+
+---
+
+**Q6: `visual_projection` 为什么用 `modules_to_save` 而不是 LoRA？**
+
+`visual_projection` 是一个 768→512 的线性层，直接决定最终 embedding 的几何结构。它是 CLIP embedding space 的"出口"。
+
+用 LoRA 的前提假设是原始权重的方向是对的，只需要低秩扰动。但对于 `visual_projection` 来说，我们希望**完全重塑** embedding 空间来适应购物车商品的检索任务，原始的通用 CLIP projection 未必最优。
+
+用 `modules_to_save` 意味着完整保存和训练这一层的所有参数，不做低秩约束，给模型最大自由度来重新定义 embedding 的度量空间。代价是多存一个 768×512 的矩阵（约 1.5MB），可以接受。
+
+---
+
+**Q7: 文字描述在训练里起什么作用？推理时有没有用到？**
+
+**训练时**：GPT-5 生成的文字描述经过冻结的 text encoder 变成 text embedding，作为 supervision anchor。image encoder 学习让商品图像的 embedding 靠近对应的 text embedding，远离不相关的 text embedding（InfoNCE loss）。文字描述提供了丰富的语义监督信号，比纯图像对比学习给模型更多关于"什么是相同商品"的信息。
+
+**推理时完全不用**。只导出 `model.visual`，text encoder 不打包进 TRT engine。边缘设备上没有文字，所有检索都是 image-to-image。文字只是训练时的"老师"，帮助 visual encoder 学到更好的商品表示，训练完就不再需要了。
+
+---
+
+### 模块三：评估设计
+
+**Q8: 你们的 offline 评估和真实线上场景有什么 gap？怎么缓解？**
+
+**主要 gap**：
+1. **数据分布**：offline 用实验室采集的数据，光照、摆放角度相对固定。线上购物车是用户随机拿放，图像质量更差，遮挡更多
+2. **时间差**：offline 的 index session 和 query session 可能是同一天采集的。线上 index 是几秒前扫码建的，query 是几分钟后取出时的，但商品可能被移动过
+3. **Basket size**：offline 控制了 basket size，线上是真实分布（通常 5-15 件商品）
+
+**缓解措施**：
+- 用 `simulate_multi_basket_size_evaluation.py` 模拟不同 basket size，给出带置信区间的 accuracy vs basket size 曲线，对齐真实分布
+- 大规模生产数据评估（MAX_ITEMS=2000）使用线上采集的真实数据，比 lab 数据更接近真实分布
+- Frame-level 和 item-level 两个粒度评估，item-level 的 mean 聚合更接近线上逻辑
+
+---
+
+**Q9: 为什么 threshold 调优要 precision-first，而不是 F1 或 recall-first？**
+
+这是业务决策，不是技术决策。
+
+RII 的 removal re-identification 结果会发布到 Redis，上游系统用它来更新购物车状态（扣减商品）。
+
+- **False Positive 的代价**：把 A 商品取出，系统认为是 B 被取出，会在购物车里扣减错误商品，影响用户结账，是**直接错误**，用户可感知，非常严重
+- **False Negative 的代价**：商品被取出但系统没有识别出来，购物车状态没更新，可以通过其他方式兜底（用户手动确认、结账时核对），代价相对小
+
+宁可不报，不能报错，precision-first。同样道理在搜广推里也很常见，比如广告召回宁可少召回也不能召回低质内容影响用户体验。
+
+---
+
+**Q10: K-means k=4 怎么验证是最优的？有没有做过 ablation？**
+
+k=4 是经验性选择，没有用 elbow method 或 silhouette score 做严格的 k 选择。
+
+直觉依据：一件包装商品的主要视觉外观变体通常是 4 个方向（正面/背面/侧面/顶部），k=4 刚好对应这个先验。
+
+验证方法：
+- 在评估集上跑 k=2/4/8/16 的 Top-1 accuracy 曲线，k=4 是边际收益开始下降的拐点
+- 同时考虑内存约束：k=4 是 8KB/item，k=16 是 32KB/item，在 Jetson 上增加 4 倍内存开销
+- cv::kmeans 输出 compactness，k=4 时已经较低，增加 k 提升不大
+
+更严格的做法是用 spherical K-means（对 L2-normalized embedding 在球面上做聚类）。标准 K-means 用 Euclidean 均值作为 centroid，在单位球面上理论上不是最优的，但实践中差异很小。
+
+---
+
+### 模块四：工程与部署
+
+**Q11: SharedTrtModel 共享一个 TRT engine 给 item recognition 和 location recognition，这个设计有什么风险？**
+
+**好处**：节省 GPU 显存（Jetson 显存有限，两个任务复用一个 engine），减少引擎初始化时间。
+
+**风险**：
+1. **资源竞争**：两个任务并发请求时，共享 engine 的 batch queue 可能产生排队延迟，某一个任务的延迟会影响另一个
+2. **耦合性**：如果 item recognition 需要升级模型，location recognition 也要跟着重新部署，即使 location 模型不需要更新
+3. **输出解析耦合**：两个任务的 postprocessFunc 都注册在同一个 SharedTrtModel 上，通过 sessionId 区分，出 bug 时难以隔离
+
+**缓解**：当前可以接受，因为两个任务在时序上基本不重叠。如果未来需要解耦，分成两个 engine 是正确方向，代价是多占一份显存。
+
+---
+
+**Q12: 生产模式下聚类后删除原始 embeddings，如果需要重新聚类（比如 k 值变了），怎么办？**
+
+这是一个不可逆操作，是工程 tradeoff 的代价。
+
+当前设计下，k 值来自 proto config（`cluster_count`），可以热更新。但一旦原始 embeddings 被清除，改 k 值后无法对已有商品重新聚类，只能对新扫入的商品用新 k 值。
+
+实际影响有限：
+1. 一次购物 session 通常只有 20-30 分钟，k 值不会在一次购物中间改变
+2. k 值属于模型配置，更新频率极低
+
+如果要支持 k 值动态更新：
+- Debug 模式（`debugModeEnabled=true`）保留原始 embeddings，可以随时重新聚类，代价是内存增加
+- 记录每个 embedding 的 camera + timestamp，必要时重新推理（但历史帧已经消费掉）
+
+---
+
+### 模块五：系统延伸与反思
+
+**Q13: 如果让你重新设计这个系统，会改什么？**
+
+三个方向：
+
+**1. Spherical K-means 替代标准 K-means**
+CLIP embedding 是 L2-normalized 的单位向量，存在于高维球面上。标准 K-means 用 Euclidean 均值，centroid 不在单位球面上，理论上有偏差。Spherical K-means 在每次更新 centroid 后做 L2 normalize，更适合 cosine similarity 检索。实现成本低，预期有小幅精度提升。
+
+**2. 在线增量更新 centroid**
+当前设计是 barcode 扫描时一次性聚类，之后不再更新。但用户拿取商品过程中，持续获得新的 embedding（不同角度、不同光照）。可以用在线 K-means 或 exponential moving average 持续更新 centroid，让索引更完整。
+
+**3. 软标签 vs 硬 K-means**
+K-means 是硬分配，每个 embedding 只归属一个 cluster。如果商品视觉变化是连续的（比如圆柱形商品从任意角度看），高斯混合模型（GMM）或 soft assignment 可以更好地建模这种连续性。代价是推理时不再是简单的 max cosine，需要 density estimation。
+
+---
+
+**Q14: 这套系统对搜广推有哪些可迁移的经验？**
+
+**1. 双塔结构的 domain adaptation**
+用 LoRA 做 visual encoder 的域适配，对应搜广推里对预训练双塔模型做业务微调。关键是冻结一个 tower（text encoder）作为 anchor，只适配另一个，这在 user tower / item tower 分别用不同预训练模型时也适用。
+
+**2. 动态 index vs 静态 index**
+我们的 item index 是每次购物实时构建的。搜广推里通常是离线建全量 item index，但对于新商品、新内容的冷启动问题，动态索引的思路（加购时就建索引）可以作为 real-time 补充召回路径。
+
+**3. 评估设计的业务对齐**
+不只看 Top-K accuracy，还做 basket size simulation（对应搜广推里 recall set size 变化对 ranking 精度的影响）。threshold 调优的 precision-recall tradeoff 和广告 CTR/CVR 预测中的阈值决策完全一致。
+
+**4. 边缘侧部署约束反向影响模型设计**
+LoRA adapter 的选择、只导出 visual encoder、K-means 而非 FAISS，都是部署约束反向推动的设计决策。搜广推在移动端做轻量化召回/排序时面对同样的约束（模型压缩、量化、延迟预算）。
+
+---
+
+### 答题策略
+
+| 问题类型 | 回答策略 |
+|---|---|
+| 设计类（为什么选X） | 先说 constraint，再说 tradeoff，最后说 evidence（代码/实验） |
+| 评估类 | 先说指标设计的业务逻辑，再说 offline/online gap，再说缓解措施 |
+| 工程类 | 先说好处，再主动说风险，显示对系统有完整认知 |
+| 反思类 | 1个理论改进 + 1个工程改进 + 1个业务改进，有取舍意识 |
 
 ---
 
