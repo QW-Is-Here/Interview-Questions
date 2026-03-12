@@ -123,6 +123,17 @@ Output: 512-dim L2-normalized embedding
 
 ---
 
+
+  ┌──────────────────┬────────────────────────────────────┬────────────────────────────────────────────┬──────┐
+  │      Route       │                File                │                Supervision                 │  LR  │
+  ├──────────────────┼────────────────────────────────────┼────────────────────────────────────────────┼──────┤
+  │ LoRA finetune    │ peft_finetune/main.py              │ image-text (frozen text encoder as anchor) │ 5e-4 │
+  ├──────────────────┼────────────────────────────────────┼────────────────────────────────────────────┼──────┤
+  │ Full finetune    │ full_finetune/main.py              │ image-text (frozen text encoder as anchor) │ 1e-5 │
+  ├──────────────────┼────────────────────────────────────┼────────────────────────────────────────────┼──────┤
+  │ Catalog finetune │ image_catalog_training/finetune.py │ image-image only (no text at all)          │ 1e-5 │
+  └──────────────────┴────────────────────────────────────┴────────────────────────────────────────────┴──────┘
+
 ### 1.3 LoRA Fine-tuning (Main Route)
 
 ```python
