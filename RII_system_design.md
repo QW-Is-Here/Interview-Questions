@@ -133,6 +133,25 @@ Output: 512-dim L2-normalized embedding
   ├──────────────────┼────────────────────────────────────┼────────────────────────────────────────────┼──────┤
   │ Catalog finetune │ image_catalog_training/finetune.py │ image-image only (no text at all)          │ 1e-5 │
   └──────────────────┴────────────────────────────────────┴────────────────────────────────────────────┴──────┘
+
+  What the three are actually for
+
+  image_catalog_training    Early experiment / baseline
+          |                 Pure image-image, older OpenAI clip library
+          |                 Likely the first attempt before text supervision
+          v
+
+  full_finetune             Ablation baseline
+          |                 Full parameter update, heavier
+          |                 Used to measure: does LoRA match full finetune quality?
+          v
+
+  peft_finetune (LoRA)      Production model
+                            Small adapter, deployable to Jetson
+                            What actually goes through ONNX -> TRT -> edge
+
+  It's an iterative research progression, not three parallel deployed models. You compare all three in offline eval (evaluate.py), pick
+  the best, deploy only that one. The LoRA route won the tradeoff between accuracy and deployability.
 ```
 
 ### 1.3 LoRA Fine-tuning (Main Route)
