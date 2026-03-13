@@ -376,6 +376,127 @@ score = p_ctr^α * p_cvr^β * p_quality^γ
 
 ---
 
+### 7.5 多目标 Loss 打架问题
+
+#### 什么是打架
+
+```
+任务A（CTR）的梯度方向: →
+任务B（CVR）的梯度方向: ←
+合力: 接近0 → 共享层参数几乎不更新
+      或互相抵消 → 某任务反而变差
+```
+
+本质是**梯度冲突（Gradient Conflict）**：不同任务对共享参数的更新方向不一致甚至相反。
+
+#### 方法一：固定权重加权（基线）
+
+```python
+loss = w1 * loss_ctr + w2 * loss_cvr + w3 * loss_like
+```
+
+**问题**：w 是人工超参，不同任务 loss 量级不同，各任务收敛速度不同导致固定权重在不同阶段效果不一致。
+**实践**：先归一化各任务 loss 到同一量级，再设权重。
+
+#### 方法二：GradNorm（动态权重）
+
+让各任务梯度的模长保持一致，自动调权重：
+
+```python
+# 训练慢的任务权重自动变大，快的变小
+for task_i in tasks:
+    grad_norm_i = ||∇_W (w_i * loss_i)||_2
+
+target_norm = mean(grad_norms) * (training_rate_i / mean_rate)^α
+gradnorm_loss = Σ |grad_norm_i - target_norm_i|  # 额外约束权重
+```
+
+#### 方法三：PCGrad（梯度外科手术）
+
+直接在梯度层面把冲突分量投影掉：
+
+```python
+def pcgrad(grads):
+    new_grads = []
+    for i, g_i in enumerate(grads):
+        g_new = g_i.clone()
+        for j, g_j in enumerate(grads):
+            if i == j:
+                continue
+            # 内积<0说明方向冲突，把冲突分量减掉
+            if torch.dot(g_i, g_j) < 0:
+                g_new -= (torch.dot(g_i, g_j) / g_j.norm()**2) * g_j
+        new_grads.append(g_new)
+    return sum(new_grads)
+```
+
+```
+g_i: →→→
+g_j: ←←←（冲突）
+
+修正后g_i: →→（只保留不冲突部分）
+```
+
+**优点**：无额外超参数；**缺点**：O(T²) 复杂度
+
+#### 方法四：Uncertainty Weighting（自动学习权重）
+
+把每个任务的权重建模为任务的**不确定性**，自动学习：
+
+```python
+class UncertaintyWeighting(nn.Module):
+    def __init__(self, num_tasks):
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+
+    def forward(self, losses):
+        total = 0
+        for i, loss in enumerate(losses):
+            precision = torch.exp(-self.log_vars[i])
+            total += precision * loss + self.log_vars[i]
+            # = loss / (2σ²) + log(σ)
+        return total
+```
+
+不确定性大（σ大）的任务权重自动降低，有贝叶斯理论支撑。
+
+#### 方法五：PLE 结构（从源头减少冲突）
+
+与其事后处理梯度冲突，不如从模型结构上减少共享：
+
+```
+每个任务有独享 Expert + 共享 Expert
+Task-specific Expert: 只服务该任务，无冲突
+Shared Expert:        服务所有任务，Gate加权选择
+
+Layer 1: [Shared Experts] [Task-A Experts] [Task-B Experts]
+              ↓ Gate_A          ↓                ↓ Gate_B
+Layer 2: [Shared Experts] [Task-A Experts] [Task-B Experts]
+```
+
+PLE 比 MMoE 好的原因：MMoE 的 Expert 全部共享，任务差异大时 Expert 间也打架；PLE 的私有 Expert 保证任务特定知识不被污染。
+
+#### 工业界处理优先级
+
+```
+1. 先看 loss 曲线 → 量级问题先归一化
+2. 可视化梯度余弦相似度 → 接近-1说明严重冲突
+3. 结构先行: 优先用 PLE，从源头隔离冲突
+4. 再叠加动态权重: Uncertainty Weighting（改动小）
+5. 最后考虑 PCGrad: 效果好但实现复杂
+```
+
+#### 容易忽略的问题：数据分布差异
+
+```
+CTR 正样本比例: ~5%
+CVR 正样本比例: ~2%（更稀疏）
+```
+
+CVR 因样本极稀疏，梯度噪声远大于 CTR，会被 CTR 梯度"淹没"。
+解决：对 CVR 任务做**过采样或提高 loss weight**，先解决样本量问题，再处理梯度方向问题。
+
+---
+
 ## 八、Position Bias
 
 ### 8.1 什么是 Position Bias
